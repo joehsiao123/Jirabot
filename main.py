@@ -1,123 +1,128 @@
 import streamlit as st
+from jira import JIRA
 import discord
 from discord.ext import commands, tasks
-from jira import JIRA
-import threading
 import asyncio
+import threading
 from datetime import datetime
-import time
 
-# --- 1. 持久化日誌 ---
-if 'global_logs' not in st.session_state:
-    st.session_state.global_logs = [f"[{datetime.now().strftime('%H:%M:%S')}] 系統啟動..."]
+# --- 1. 頁面初始化 ---
+st.set_page_config(page_title="Jira 任務清單與機器人", layout="wide")
+st.title("📋 Jira 議題清單 & 機器人控制台")
 
-def add_log(msg):
-    now = datetime.now().strftime("%H:%M:%S")
-    st.session_state.global_logs.append(f"[{now}] {msg}")
-    if len(st.session_state.global_logs) > 30:
-        st.session_state.global_logs.pop(0)
-
-# --- 2. 載入設定 ---
+# 讀取 Secrets
 try:
     S = st.secrets
-    CONF = {
-        "D_TOKEN": S["DISCORD_TOKEN"],
-        "CH_ID": int(S["CHANNEL_ID"]),
+    conf = {
         "J_SERVER": S["JIRA_SERVER"],
         "J_EMAIL": S["JIRA_EMAIL"],
         "J_TOKEN": S["JIRA_API_TOKEN"],
+        "D_TOKEN": S["DISCORD_TOKEN"],
+        "CH_ID": int(S["CHANNEL_ID"]),
         "PROJ": S["TARGET_PROJECT"],
-        "UID": S["ASSIGNEE_ID"],
-        "TIME": int(S.get("CHECK_INTERVAL", 1))
+        "UID": S["ASSIGNEE_ID"]
     }
 except Exception as e:
     st.error(f"❌ Secrets 載入失敗: {e}")
     st.stop()
 
-# --- 3. Discord 機器人類別 ---
-class JiraMonitorBot(commands.Bot):
+# 初始化 Jira 連線
+@st.cache_resource
+def get_jira():
+    return JIRA(server=conf["J_SERVER"], basic_auth=(conf["J_EMAIL"], conf["J_TOKEN"]))
+
+jira = get_jira()
+
+# --- 2. 展示符合條件的 Issue List ---
+st.header(f"🔍 目前符合條件的 Issue (專案: {conf['PROJ']})")
+
+try:
+    # JQL: 指定專案、指定負責人、按建立時間排序
+    jql = f'project = "{conf["PROJ"]}" AND assignee = "{conf["UID"]}" ORDER BY created DESC'
+    issues = jira.search_issues(jql, maxResults=5)
+
+    if issues:
+        # 使用表格顯示
+        issue_data = []
+        for issue in issues:
+            issue_data.append({
+                "Key": issue.key,
+                "Summary": issue.fields.summary,
+                "Status": issue.fields.status.name,
+                "Created": issue.fields.created[:10],
+                "Link": f"{conf['J_SERVER']}/browse/{issue.key}"
+            })
+        st.table(issue_data)
+        st.success(f"✅ 成功找到 {len(issues)} 筆相符的議題")
+    else:
+        st.warning("⚠️ 目前 Jira 上沒有符合條件 (Assignee + Project) 的 Issue。")
+        st.info(f"當前搜尋條件: `{jql}`")
+
+except Exception as e:
+    st.error(f"❌ Jira 資料抓取失敗: {e}")
+
+st.divider()
+
+# --- 3. Discord 機器人邏輯 ---
+st.header("🤖 機器人監控狀態")
+
+if 'bot_logs' not in st.session_state:
+    st.session_state.bot_logs = []
+
+def add_log(msg):
+    now = datetime.now().strftime("%H:%M:%S")
+    st.session_state.bot_logs.append(f"[{now}] {msg}")
+
+class JiraBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
-        self.last_seen_key = None
-        self.jira = None
+        self.last_key = issues[0].key if issues else None
 
     async def setup_hook(self):
-        # 延遲初始化 Jira，避免阻塞啟動
+        self.check_loop.start()
+
+    @tasks.loop(minutes=1)
+    async def check_loop(self):
         try:
-            add_log("📡 正在嘗試連線 Jira...")
-            self.jira = JIRA(server=CONF["J_SERVER"], basic_auth=(CONF["J_EMAIL"], CONF["J_TOKEN"]))
-            add_log("✅ Jira 連線成功")
-        except Exception as e:
-            add_log(f"❌ Jira 連線失敗: {e}")
-        
-        self.check_jira_task.start()
-        add_log("✅ 掃描任務已掛載 (Tasks Started)")
-
-    async def on_ready(self):
-        add_log(f"✅ Discord 機器人已上線: {self.user}")
-
-    @tasks.loop(minutes=CONF["TIME"])
-    async def check_jira_task(self):
-        if not self.jira:
-            return
-            
-        try:
-            jql = f'project = "{CONF["PROJ"]}" AND assignee = "{CONF["UID"]}" ORDER BY created DESC'
-            issues = self.jira.search_issues(jql, maxResults=1)
-
-            if issues:
-                curr = issues[0]
-                if self.last_seen_key is None:
-                    self.last_seen_key = curr.key
-                    add_log(f"📍 初始監測點: {curr.key}")
-                    return
-
-                if curr.key != self.last_seen_key:
-                    self.last_seen_key = curr.key
-                    channel = self.get_channel(CONF["CH_ID"])
+            # 再次檢查最新一筆
+            check_issues = jira.search_issues(jql, maxResults=1)
+            if check_issues:
+                new_key = check_issues[0].key
+                if self.last_key and new_key != self.last_key:
+                    self.last_key = new_key
+                    channel = self.get_channel(conf["CH_ID"])
                     if channel:
-                        await channel.send(f"🚨 **新任務通知**: {curr.key}\n{curr.fields.summary}")
-                        add_log(f"📩 Discord 通知已送出: {curr.key}")
-            else:
-                add_log("🔍 掃描中: 尚無新議題")
+                        await channel.send(f"🚨 **偵測到新指派議題**: {new_key}\n標題: {check_issues[0].fields.summary}")
+                        add_log(f"📩 已發送 Discord 通知: {new_key}")
+                else:
+                    add_log("🔍 每分鐘檢查中：尚無新議題")
         except Exception as e:
-            add_log(f"❌ 掃描循環異常: {e}")
+            add_log(f"❌ 檢查出錯: {e}")
 
-# --- 4. Streamlit 介面與啟動邏輯 ---
-st.title("Jira 🔍 Discord 控制台")
+# 啟動按鈕
+if "bot_running" not in st.session_state:
+    st.session_state.bot_running = False
 
-if "bot_started" not in st.session_state:
-    st.session_state.bot_started = False
+if st.button("🚀 啟動 Discord 機器人即時監控"):
+    if not st.session_state.bot_running:
+        def run_bot():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            bot = JiraBot()
+            bot.run(conf["D_TOKEN"])
+        
+        thread = threading.Thread(target=run_bot, daemon=True)
+        thread.start()
+        st.session_state.bot_running = True
+        st.success("機器人已在背景啟動！每分鐘將自動比對一次。")
+    else:
+        st.info("機器人已經在運行中。")
 
-def start_bot():
-    # 強制建立新的事件迴圈
-    new_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(new_loop)
-    bot = JiraMonitorBot()
-    try:
-        # 使用 run 之前先確認 Token 是否正確
-        bot.run(CONF["D_TOKEN"])
-    except Exception as e:
-        add_log(f"❌ 機器人運行崩潰: {str(e)}")
-
-if not st.session_state.bot_started:
-    thread = threading.Thread(target=start_bot, daemon=True)
-    thread.start()
-    st.session_state.bot_started = True
-    add_log("🚀 啟動執行緒中...")
-
-# --- UI 顯示 ---
-if st.button("🔄 手動刷新日誌與狀態"):
-    st.rerun()
-
-st.subheader("📝 運行日誌")
-# 組合並顯示日誌
-full_log = "\n".join(st.session_state.global_logs[::-1])
-st.text_area("Live Log", value=full_log, height=400)
-
-# 狀態儀表板
-st.divider()
-st.write(f"**檢查對象專案:** {CONF['PROJ']}")
-st.write(f"**檢查對象 ID:** {CONF['UID']}")
+# 日誌顯示
+if st.session_state.bot_running:
+    st.subheader("📝 機器人運行日誌")
+    if st.button("刷新日誌"):
+        st.rerun()
+    st.text_area("Logs", value="\n".join(st.session_state.bot_logs[::-1]), height=200)
