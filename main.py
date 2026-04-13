@@ -9,43 +9,25 @@ import time
 
 # --- 1. 基礎設定 ---
 st.set_page_config(page_title="Jira 監控中心", layout="wide")
-st.title("📋 Jira 監控 & Discord 機器人")
+st.title("📋 Jira 列表同步 & Discord 機器人")
 
 try:
     S = st.secrets
     conf = {
+        "D_TOKEN": S["DISCORD_TOKEN"],
+        "CH_ID": int(S["CHANNEL_ID"]),
         "J_SERVER": S["JIRA_SERVER"],
         "J_EMAIL": S["JIRA_EMAIL"],
         "J_TOKEN": S["JIRA_API_TOKEN"],
-        "D_TOKEN": S["DISCORD_TOKEN"],
-        "CH_ID": int(S["CHANNEL_ID"]),
         "PROJ": S["TARGET_PROJECT"],
-        "UID": S["ASSIGNEE_ID"]
+        "UID": S["ASSIGNEE_ID"],
+        "TIME": int(S.get("CHECK_INTERVAL", 1))
     }
 except Exception as e:
     st.error(f"❌ Secrets 載入失敗: {e}")
     st.stop()
 
-# Jira 初始化
-jira = JIRA(server=conf["J_SERVER"], basic_auth=(conf["J_EMAIL"], conf["J_TOKEN"]))
-
-# --- 2. 議題列表 (確保資料源正確) ---
-st.subheader(f"🔍 當前追蹤議題 (專案: {conf['PROJ']})")
-jql = f'project = "{conf["PROJ"]}" AND assignee = "{conf["UID"]}" ORDER BY created DESC'
-issues = jira.search_issues(jql, maxResults=5)
-
-if issues:
-    st.table([{"Key": i.key, "Summary": i.fields.summary, "Status": i.fields.status.name} for i in issues])
-    initial_key = issues[0].key
-else:
-    st.warning("目前無符合條件的議題。")
-    initial_key = None
-
-st.divider()
-
-# --- 3. 機器人核心邏輯 ---
-if 'bot_status' not in st.session_state:
-    st.session_state.bot_status = "未啟動"
+# --- 2. 機器人核心邏輯 ---
 if 'logs' not in st.session_state:
     st.session_state.logs = []
 
@@ -58,66 +40,81 @@ class JiraBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
-        self.last_key = initial_key
+        self.jira = JIRA(server=conf["J_SERVER"], basic_auth=(conf["J_EMAIL"], conf["J_TOKEN"]))
+        self.last_key = None
 
     async def on_ready(self):
         add_log(f"✅ 機器人成功登入: {self.user.name}")
-        st.session_state.bot_status = "🟢 運行中"
-        
-        # 嘗試發送啟動測試訊息
         channel = self.get_channel(conf["CH_ID"])
+        
         if channel:
-            await channel.send("🚀 **Jira 監控機器人已在 Streamlit 上線！**")
-            add_log("📬 已在 Discord 頻道發送上線通知")
+            try:
+                # 1. 抓取當前清單
+                jql = f'project = "{conf["PROJ"]}" AND assignee = "{conf["UID"]}" ORDER BY created DESC'
+                issues = self.jira.search_issues(jql, maxResults=5)
+                
+                if issues:
+                    self.last_key = issues[0].key # 標記目前最新的一筆
+                    
+                    # 2. 格式化訊息
+                    msg = f"📋 **當前 Jira 待辦清單 (專案: {conf['PROJ']})**\n"
+                    msg += "------------------------------------------\n"
+                    for i in issues:
+                        msg += f"🔹 **[{i.key}]** {i.fields.summary} (`{i.fields.status.name}`)\n"
+                    msg += "------------------------------------------\n"
+                    msg += "✨ *機器人已進入即時監控模式...*"
+                    
+                    await channel.send(msg)
+                    add_log("📬 已將初始列表同步至 Discord")
+                else:
+                    await channel.send(f"✅ 機器人已上線，但目前在專案 `{conf['PROJ']}` 中找不到指派給你的任務。")
+                    add_log("⚠️ 找不到任務，已發送空列表通知")
+            except Exception as e:
+                add_log(f"❌ 初始發送失敗: {e}")
         else:
-            add_log("❌ 找不到頻道，請確認 Bot 已加入該伺服器且 ID 正確")
+            add_log("❌ 找不到 Discord 頻道，請確認 ID 與權限")
 
     async def setup_hook(self):
         self.check_loop.start()
 
-    @tasks.loop(minutes=1)
+    @tasks.loop(minutes=conf["TIME"])
     async def check_loop(self):
+        # 這裡維持每分鐘檢查是否有「新」Issue 的邏輯
         try:
-            # 每分鐘抓取最新一筆
-            current_issues = jira.search_issues(jql, maxResults=1)
+            jql = f'project = "{conf["PROJ"]}" AND assignee = "{conf["UID"]}" ORDER BY created DESC'
+            current_issues = self.jira.search_issues(jql, maxResults=1)
             if current_issues:
                 new_key = current_issues[0].key
                 if self.last_key and new_key != self.last_key:
                     self.last_key = new_key
                     channel = self.get_channel(conf["CH_ID"])
                     if channel:
-                        await channel.send(f"🔔 **新任務指派**: {new_key}\n{current_issues[0].fields.summary}")
-                        add_log(f"🔥 發現新任務並通知: {new_key}")
-                else:
-                    add_log("💤 掃描中: 暫無變動")
+                        await channel.send(f"🔔 **偵測到新任務！**\n**[{new_key}]** {current_issues[0].fields.summary}")
+                        add_log(f"🔥 發現新變動: {new_key}")
         except Exception as e:
-            add_log(f"❌ 掃描出錯: {e}")
+            add_log(f"❌ 輪詢出錯: {e}")
 
-# --- 4. 啟動器 ---
-st.subheader(f"🤖 機器人控制台 (狀態: {st.session_state.bot_status})")
+# --- 3. Streamlit 介面 ---
+if 'bot_started' not in st.session_state:
+    st.session_state.bot_started = False
 
-if st.button("🚀 啟動監控機器人"):
-    if st.session_state.bot_status == "未啟動":
-        def start_thread():
+if st.button("🚀 啟動機器人並同步列表"):
+    if not st.session_state.bot_started:
+        def start_bot():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             bot = JiraBot()
-            try:
-                bot.run(conf["D_TOKEN"])
-            except Exception as e:
-                add_log(f"❌ 啟動崩潰: {e}")
-
-        t = threading.Thread(target=start_thread, daemon=True)
-        t.start()
-        st.session_state.bot_status = "⏳ 啟動中..."
-        add_log("⏳ 執行緒已開啟，嘗試登入 Discord...")
-        time.sleep(2)
+            bot.run(conf["D_TOKEN"])
+        
+        thread = threading.Thread(target=start_bot, daemon=True)
+        thread.start()
+        st.session_state.bot_started = True
+        add_log("⏳ 正在啟動執行緒...")
+        time.sleep(1)
         st.rerun()
-    else:
-        st.info("機器人正在運作或啟動中。")
 
-# 顯示日誌
-st.text_area("Live Logs", value="\n".join(st.session_state.logs[::-1]), height=250)
+st.subheader("📝 運行日誌")
+st.text_area("Logs", value="\n".join(st.session_state.logs[::-1]), height=300)
 
-if st.button("🔄 刷新日誌"):
+if st.button("🔄 刷新頁面"):
     st.rerun()
