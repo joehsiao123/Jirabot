@@ -5,111 +5,154 @@ from jira import JIRA
 import threading
 import asyncio
 from datetime import datetime
+import traceback
 
-# --- 1. 初始化與設定 ---
-# 在 Streamlit Cloud 上，這些資訊會從 Secrets 讀取
+# --- 頁面配置 ---
+st.set_page_config(page_title="Jira Bot Debugger", layout="wide")
+st.title("🛠️ Jira 機器人診斷監控面板")
+
+# --- 1. 安全讀取 Secrets ---
 try:
-    DISCORD_TOKEN = st.secrets["DISCORD_TOKEN"]
-    CHANNEL_ID = int(st.secrets["CHANNEL_ID"])
-    JIRA_SERVER = st.secrets["JIRA_SERVER"]
-    JIRA_EMAIL = st.secrets["JIRA_EMAIL"]
-    JIRA_API_TOKEN = st.secrets["JIRA_API_TOKEN"]
-    
-    # 篩選條件
-    TARGET_PROJECT = st.secrets["TARGET_PROJECT"] # 例如: 'PROJ'
-    ASSIGNEE_ID = st.secrets["ASSIGNEE_ID"] # Jira 使用者的 Account ID 或 Email
-    INTERVAL = int(st.secrets.get("CHECK_INTERVAL", 1))
+    CONFIG = {
+        "DISCORD_TOKEN": st.secrets["DISCORD_TOKEN"],
+        "CHANNEL_ID": int(st.secrets["CHANNEL_ID"]),
+        "JIRA_SERVER": st.secrets["JIRA_SERVER"],
+        "JIRA_EMAIL": st.secrets["JIRA_EMAIL"],
+        "JIRA_API_TOKEN": st.secrets["JIRA_API_TOKEN"],
+        "TARGET_PROJECT": st.secrets["TARGET_PROJECT"],
+        "ASSIGNEE_ID": st.secrets["ASSIGNEE_ID"],
+        "INTERVAL": int(st.secrets.get("CHECK_INTERVAL", 1))
+    }
+    st.sidebar.success("✅ Secrets 載入成功")
 except Exception as e:
-    st.error("❌ 找不到 Secrets 設定，請確認 .streamlit/secrets.toml 或 Streamlit 後台設定。")
+    st.error(f"❌ Secrets 設定錯誤: {e}")
     st.stop()
 
-# 初始化 Jira 連線
-jira = JIRA(server=JIRA_SERVER, basic_auth=(JIRA_EMAIL, JIRA_API_TOKEN))
-
-# --- 2. Discord 機器人邏輯 ---
-class JiraBot(commands.Bot):
+# --- 2. Discord 機器人類別 ---
+class DebugJiraBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         super().__init__(command_prefix="!", intents=intents)
         self.last_seen_key = None
         self.logs = []
+        self.is_running = False
+        
+        # 建立 Jira 連線
+        try:
+            self.jira = JIRA(
+                server=CONFIG["JIRA_SERVER"], 
+                basic_auth=(CONFIG["JIRA_EMAIL"], CONFIG["JIRA_API_TOKEN"])
+            )
+        except Exception as e:
+            self.add_log(f"CRITICAL: Jira 連線失敗 - {e}")
 
     def add_log(self, msg):
-        now = datetime.now().strftime("%H:%M:%S")
-        self.logs.append(f"[{now}] {msg}")
-        if len(self.logs) > 10: self.logs.pop(0)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        full_msg = f"[{timestamp}] {msg}"
+        self.logs.append(full_msg)
+        print(full_msg) # 同時印在後台終端機
 
     async def setup_hook(self):
+        self.add_log("🤖 Discord Bot 正在初始化 Hook...")
         self.check_jira.start()
 
-    @tasks.loop(minutes=INTERVAL)
+    @tasks.loop(minutes=CONFIG["INTERVAL"])
     async def check_jira(self):
-        channel = self.get_channel(CHANNEL_ID)
-        if not channel: return
-
-        # JQL: 指定專案 + 指定負責人 + 按建立時間排序
-        jql = f'project = "{TARGET_PROJECT}" AND assignee = "{ASSIGNEE_ID}" ORDER BY created DESC'
-        
+        self.add_log("🔍 開始一輪 Jira 掃描...")
         try:
-            issues = jira.search_issues(jql, maxResults=1)
-            if issues:
-                new_issue = issues[0]
+            # 診斷 1: 測試 Jira 身分
+            myself = self.jira.myself()
+            self.add_log(f"👤 已登入 Jira: {myself['displayName']} ({myself['emailAddress']})")
+
+            # 診斷 2: 檢查專案是否存在
+            project = self.jira.project(CONFIG["TARGET_PROJECT"])
+            self.add_log(f"📁 找到專案: {project.name}")
+
+            # 診斷 3: 執行 JQL 搜尋
+            jql = f'project = "{CONFIG["TARGET_PROJECT"]}" AND assignee = "{CONFIG["ASSIGNEE_ID"]}" ORDER BY created DESC'
+            self.add_log(f"🔎 執行 JQL: {jql}")
+            
+            issues = self.jira.search_issues(jql, maxResults=1)
+            
+            if not issues:
+                self.add_log("⚠️ 結果為空！請確認 Assignee ID 是否正確。")
+                # 額外嘗試：搜尋該專案的所有 Issue 
+                all_issues = self.jira.search_issues(f'project = "{CONFIG["TARGET_PROJECT"]}"', maxResults=1)
+                if all_issues:
+                    correct_assignee = all_issues[0].fields.assignee
+                    self.add_log(f"💡 建議：專案中最新 Issue 的負責人 ID 為: {correct_assignee.accountId if correct_assignee else '未指派'}")
+                return
+
+            current_issue = issues[0]
+            self.add_log(f"✅ 成功抓取最新 Issue: {current_issue.key}")
+
+            # 檢查是否為新議題
+            if self.last_seen_key is None:
+                self.last_seen_key = current_issue.key
+                self.add_log(f"📍 初始標記完成，將從下一張新 Issue 開始通知。")
+                return
+
+            if current_issue.key != self.last_seen_key:
+                old_key = self.last_seen_key
+                self.last_seen_key = current_issue.key
+                self.add_log(f"🔥 偵測到新變動! {old_key} -> {current_issue.key}")
                 
-                if self.last_seen_key is None:
-                    self.last_seen_key = new_issue.key
-                    self.add_log(f"系統啟動，監控中。目前最新: {new_issue.key}")
-                    return
+                # 發送 Discord 通知
+                channel = self.get_channel(CONFIG["CHANNEL_ID"])
+                if channel:
+                    embed = discord.Embed(title="New Jira Assigned!", color=0x00ff00)
+                    embed.add_field(name="Summary", value=current_issue.fields.summary)
+                    embed.description = f"[點我查看議題]({CONFIG['JIRA_SERVER']}/browse/{current_issue.key})"
+                    await channel.send(embed=embed)
+                    self.add_log("📩 Discord 訊息已送出")
+                else:
+                    self.add_log(f"❌ 找不到頻道 ID: {CONFIG['CHANNEL_ID']}，請確認 Bot 是否在該伺服器。")
 
-                if new_issue.key != self.last_seen_key:
-                    self.last_seen_key = new_issue.key
-                    
-                    # 發送通知到 Discord
-                    embed = discord.Embed(title="🔔 發現指派給你的新議題", color=discord.Color.green())
-                    embed.add_field(name="Issue", value=f"[{new_issue.key}]({JIRA_SERVER}/browse/{new_issue.key})", inline=False)
-                    embed.add_field(name="標題", value=new_issue.fields.summary, inline=False)
-                    
-                    view = JiraActionView(new_issue.key, new_issue.fields.summary)
-                    await channel.send(embed=embed, view=view)
-                    self.add_log(f"🚀 已通知新議題: {new_issue.key}")
-            else:
-                self.add_log("檢查完畢：目前無符合條件的議題")
         except Exception as e:
-            self.add_log(f"❌ Jira 檢查出錯: {e}")
+            self.add_log(f"❌ 發生錯誤: {str(e)}")
+            self.add_log(traceback.format_exc()) # 印出詳細錯誤堆疊
 
-# Discord 互動按鈕
-class JiraActionView(discord.ui.View):
-    def __init__(self, key, summary):
-        super().__init__(timeout=None)
-        self.key = key
-        self.summary = summary
-
-    @discord.ui.button(label="Report to Project B", style=discord.ButtonStyle.primary)
-    async def report(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 這裡執行轉發到另一個專案的動作 (範例：ProjectB)
-        # 實際實作可參考之前的 jira.create_issue 邏輯
-        await interaction.response.send_message(f"已記錄轉發請求: {self.key}", ephemeral=True)
-
-# --- 3. Streamlit 介面 ---
-st.title("Jira 🔍 Discord 通知中心")
-
+# --- 3. Streamlit 運行邏輯 ---
 if "bot" not in st.session_state:
-    st.session_state.bot = JiraBot()
-    
-    def run_bot():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        st.session_state.bot.run(DISCORD_TOKEN)
-    
-    t = threading.Thread(target=run_bot, daemon=True)
-    t.start()
-    st.success("🤖 Discord 機器人已在背景啟動")
+    st.session_state.bot = DebugJiraBot()
 
-st.metric("監控專案", TARGET_PROJECT)
-st.metric("負責人 ID", ASSIGNEE_ID)
+def start_bot_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        st.session_state.bot.run(CONFIG["DISCORD_TOKEN"])
+    except Exception as e:
+        print(f"Bot 執行出錯: {e}")
 
-st.subheader("📝 即時運行日誌")
-for log in reversed(st.session_state.bot.logs):
-    st.text(log)
+if not any(t.name == "DiscordBotThread" for t in threading.enumerate()):
+    bot_thread = threading.Thread(target=start_bot_thread, name="DiscordBotThread", daemon=True)
+    bot_thread.start()
+    st.sidebar.success("🚀 機器人執行緒已啟動")
 
-if st.button("手動重新整理網頁"):
+# --- 4. 儀表板 UI ---
+st.header("📋 運行日誌")
+if st.button("🔄 刷新頁面資訊"):
     st.rerun()
+
+# 顯示日誌內容
+log_container = st.container()
+with log_container:
+    if st.session_state.bot.logs:
+        for l in reversed(st.session_state.bot.logs):
+            if "❌" in l or "CRITICAL" in l:
+                st.error(l)
+            elif "⚠️" in l or "💡" in l:
+                st.warning(l)
+            elif "✅" in l or "📩" in l:
+                st.success(l)
+            else:
+                st.text(l)
+    else:
+        st.info("等待日誌產生中... (每分鐘檢查一次)")
+
+# 顯示當前變數狀態（Debug 用）
+with st.expander("查看當前連線變數"):
+    st.write(f"**Jira Server:** {CONFIG['JIRA_SERVER']}")
+    st.write(f"**Target Project:** {CONFIG['TARGET_PROJECT']}")
+    st.write(f"**Assignee ID:** {CONFIG['ASSIGNEE_ID']}")
+    st.write(f"**Last Seen Key:** {st.session_state.bot.last_seen_key}")
