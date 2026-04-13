@@ -5,12 +5,12 @@ from discord.ext import commands, tasks
 import asyncio
 import threading
 from datetime import datetime
+import time
 
-# --- 1. 頁面初始化 ---
-st.set_page_config(page_title="Jira 任務清單與機器人", layout="wide")
-st.title("📋 Jira 議題清單 & 機器人控制台")
+# --- 1. 基礎設定 ---
+st.set_page_config(page_title="Jira 監控中心", layout="wide")
+st.title("📋 Jira 監控 & Discord 機器人")
 
-# 讀取 Secrets
 try:
     S = st.secrets
     conf = {
@@ -26,59 +26,51 @@ except Exception as e:
     st.error(f"❌ Secrets 載入失敗: {e}")
     st.stop()
 
-# 初始化 Jira 連線
-@st.cache_resource
-def get_jira():
-    return JIRA(server=conf["J_SERVER"], basic_auth=(conf["J_EMAIL"], conf["J_TOKEN"]))
+# Jira 初始化
+jira = JIRA(server=conf["J_SERVER"], basic_auth=(conf["J_EMAIL"], conf["J_TOKEN"]))
 
-jira = get_jira()
+# --- 2. 議題列表 (確保資料源正確) ---
+st.subheader(f"🔍 當前追蹤議題 (專案: {conf['PROJ']})")
+jql = f'project = "{conf["PROJ"]}" AND assignee = "{conf["UID"]}" ORDER BY created DESC'
+issues = jira.search_issues(jql, maxResults=5)
 
-# --- 2. 展示符合條件的 Issue List ---
-st.header(f"🔍 目前符合條件的 Issue (專案: {conf['PROJ']})")
-
-try:
-    # JQL: 指定專案、指定負責人、按建立時間排序
-    jql = f'project = "{conf["PROJ"]}" AND assignee = "{conf["UID"]}" ORDER BY created DESC'
-    issues = jira.search_issues(jql, maxResults=5)
-
-    if issues:
-        # 使用表格顯示
-        issue_data = []
-        for issue in issues:
-            issue_data.append({
-                "Key": issue.key,
-                "Summary": issue.fields.summary,
-                "Status": issue.fields.status.name,
-                "Created": issue.fields.created[:10],
-                "Link": f"{conf['J_SERVER']}/browse/{issue.key}"
-            })
-        st.table(issue_data)
-        st.success(f"✅ 成功找到 {len(issues)} 筆相符的議題")
-    else:
-        st.warning("⚠️ 目前 Jira 上沒有符合條件 (Assignee + Project) 的 Issue。")
-        st.info(f"當前搜尋條件: `{jql}`")
-
-except Exception as e:
-    st.error(f"❌ Jira 資料抓取失敗: {e}")
+if issues:
+    st.table([{"Key": i.key, "Summary": i.fields.summary, "Status": i.fields.status.name} for i in issues])
+    initial_key = issues[0].key
+else:
+    st.warning("目前無符合條件的議題。")
+    initial_key = None
 
 st.divider()
 
-# --- 3. Discord 機器人邏輯 ---
-st.header("🤖 機器人監控狀態")
-
-if 'bot_logs' not in st.session_state:
-    st.session_state.bot_logs = []
+# --- 3. 機器人核心邏輯 ---
+if 'bot_status' not in st.session_state:
+    st.session_state.bot_status = "未啟動"
+if 'logs' not in st.session_state:
+    st.session_state.logs = []
 
 def add_log(msg):
     now = datetime.now().strftime("%H:%M:%S")
-    st.session_state.bot_logs.append(f"[{now}] {msg}")
+    st.session_state.logs.append(f"[{now}] {msg}")
 
 class JiraBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
-        self.last_key = issues[0].key if issues else None
+        self.last_key = initial_key
+
+    async def on_ready(self):
+        add_log(f"✅ 機器人成功登入: {self.user.name}")
+        st.session_state.bot_status = "🟢 運行中"
+        
+        # 嘗試發送啟動測試訊息
+        channel = self.get_channel(conf["CH_ID"])
+        if channel:
+            await channel.send("🚀 **Jira 監控機器人已在 Streamlit 上線！**")
+            add_log("📬 已在 Discord 頻道發送上線通知")
+        else:
+            add_log("❌ 找不到頻道，請確認 Bot 已加入該伺服器且 ID 正確")
 
     async def setup_hook(self):
         self.check_loop.start()
@@ -86,43 +78,46 @@ class JiraBot(commands.Bot):
     @tasks.loop(minutes=1)
     async def check_loop(self):
         try:
-            # 再次檢查最新一筆
-            check_issues = jira.search_issues(jql, maxResults=1)
-            if check_issues:
-                new_key = check_issues[0].key
+            # 每分鐘抓取最新一筆
+            current_issues = jira.search_issues(jql, maxResults=1)
+            if current_issues:
+                new_key = current_issues[0].key
                 if self.last_key and new_key != self.last_key:
                     self.last_key = new_key
                     channel = self.get_channel(conf["CH_ID"])
                     if channel:
-                        await channel.send(f"🚨 **偵測到新指派議題**: {new_key}\n標題: {check_issues[0].fields.summary}")
-                        add_log(f"📩 已發送 Discord 通知: {new_key}")
+                        await channel.send(f"🔔 **新任務指派**: {new_key}\n{current_issues[0].fields.summary}")
+                        add_log(f"🔥 發現新任務並通知: {new_key}")
                 else:
-                    add_log("🔍 每分鐘檢查中：尚無新議題")
+                    add_log("💤 掃描中: 暫無變動")
         except Exception as e:
-            add_log(f"❌ 檢查出錯: {e}")
+            add_log(f"❌ 掃描出錯: {e}")
 
-# 啟動按鈕
-if "bot_running" not in st.session_state:
-    st.session_state.bot_running = False
+# --- 4. 啟動器 ---
+st.subheader(f"🤖 機器人控制台 (狀態: {st.session_state.bot_status})")
 
-if st.button("🚀 啟動 Discord 機器人即時監控"):
-    if not st.session_state.bot_running:
-        def run_bot():
+if st.button("🚀 啟動監控機器人"):
+    if st.session_state.bot_status == "未啟動":
+        def start_thread():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             bot = JiraBot()
-            bot.run(conf["D_TOKEN"])
-        
-        thread = threading.Thread(target=run_bot, daemon=True)
-        thread.start()
-        st.session_state.bot_running = True
-        st.success("機器人已在背景啟動！每分鐘將自動比對一次。")
-    else:
-        st.info("機器人已經在運行中。")
+            try:
+                bot.run(conf["D_TOKEN"])
+            except Exception as e:
+                add_log(f"❌ 啟動崩潰: {e}")
 
-# 日誌顯示
-if st.session_state.bot_running:
-    st.subheader("📝 機器人運行日誌")
-    if st.button("刷新日誌"):
+        t = threading.Thread(target=start_thread, daemon=True)
+        t.start()
+        st.session_state.bot_status = "⏳ 啟動中..."
+        add_log("⏳ 執行緒已開啟，嘗試登入 Discord...")
+        time.sleep(2)
         st.rerun()
-    st.text_area("Logs", value="\n".join(st.session_state.bot_logs[::-1]), height=200)
+    else:
+        st.info("機器人正在運作或啟動中。")
+
+# 顯示日誌
+st.text_area("Live Logs", value="\n".join(st.session_state.logs[::-1]), height=250)
+
+if st.button("🔄 刷新日誌"):
+    st.rerun()
